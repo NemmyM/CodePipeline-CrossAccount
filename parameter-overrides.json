@@ -1,0 +1,38 @@
+[
+    {
+        "ParameterKey": "CentralAccount",
+        "ParameterValue": "Your12DigitDevOpsAccount"
+    },
+    {
+        "ParameterKey": "DevAccount",
+        "ParameterValue": "Your12DigitDevelopmentnAccount"
+    },
+    {
+        "ParameterKey": "ProductionAccount",
+        "ParameterValue": "Your12DigitProductionAccount"
+    },
+    {
+        "ParameterKey": "Project",
+        "ParameterValue": "YourProjectName"
+    },
+    {
+        "ParameterKey": "Email",
+        "ParameterValue": "your@email.com"
+    },
+    {
+        "ParameterKey": "GitRepo",
+        "ParameterValue": "nemmym/SAM-REST-DynamoDB"
+    },
+    {
+        "ParameterKey": "GitBranch",
+        "ParameterValue": "main"
+    },
+    {
+        "ParameterKey": "GitType",
+        "ParameterValue": "GitHub"
+    },
+    {
+        "ParameterKey": "FirstRun",
+        "ParameterValue": "true"
+    }
+]

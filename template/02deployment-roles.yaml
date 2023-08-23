@@ -1,0 +1,151 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Role to be assumed by CodePipeline service cross account
+Parameters:
+  ArtifactBucket:
+    Description: S3 Bucket in the Central Account, which holds the artifacts
+    Type: String
+  CentralAccount:
+    Description: AWS Central AccountNumber
+    Type: Number
+  CMK:
+    Description: ARN of the KMS CMK creates in Tools account
+    Type: String
+  Project:
+    Type: String
+    Default: serverless
+
+Resources:
+  CFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-CentralAcctCodePipelineCFRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${CentralAccount}:role/${Project}-codepipeline-Role
+            Action:
+              - sts:AssumeRole
+      Path: /
+  CFPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-CentralAcctCodePipelineCloudFormationPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+               - cloudformation:DescribeStacks
+               - cloudformation:CreateChangeSet
+               - cloudformation:ExecuteChangeSet
+               - cloudformation:DescribeChangeSet
+               - cloudformation:DeleteChangeSet
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Project}-*"
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Project}-*"
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource:
+              - !Ref CMK
+      Roles:
+        - !Ref CFRole
+  CFDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-cloudformationdeployer-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+  CFDeployerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-cloudformationdeployer-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: cf
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+            Resource:
+              [
+                !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Project}-*",
+                #SAM requirement
+                "arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31",
+              ]
+          - Sid: s3
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub "arn:aws:s3:::${ArtifactBucket}/*"
+              #- !Sub "arn:aws:s3:::${ArtifactBucket}"
+          - Sid: iam
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:getRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRole
+              - iam:PassRole
+              - iam:CreateServiceLinkedRole
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/${Project}-*"
+          - Sid: lambda
+            Effect: Allow
+            Action:
+              - lambda:*
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Project}-*"
+          - Sid: apigw
+            Effect: Allow
+            Action:
+              - apigateway:POST # Create API.
+              - apigateway:GET # Get API info.
+              - apigateway:PATCH # Update API resources.
+              - apigateway:DELETE # Delete API in case of a rollback. 
+              - apigateway:PUT
+            Resource:
+              - "*"
+          - Sid: sqs
+            Effect: Allow
+            Action:
+              - sqs:*
+            Resource:
+              - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${Project}-Dev*"
+              - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${Project}-Prod*"
+          - Sid: DynamoDB
+            Effect: Allow
+            Action:
+              - dynamodb:*
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Project}-Dev*"
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Project}-Prod*"
+      Roles:
+        - !Ref CFDeployerRole

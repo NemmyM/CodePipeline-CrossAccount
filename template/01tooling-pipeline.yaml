@@ -1,0 +1,491 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates PreReqs for Cloudformation Projects with Pipelines (KMS, Buckets, Repos...)
+
+Parameters:
+  DevAccount:
+    Description: AWS Account Number for Development
+    Type: Number
+  ProductionAccount:
+    Description: AWS Account Number for Production
+    Type: Number
+  FirstRun:
+    Description: Conditionally adds the required policies after prereqs in other accounts are met
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  GitType:
+    Description: The source can be either codecommit or github.
+    Type: String
+    Default: 'GitHub'
+    AllowedValues:
+      - 'GitHub'
+      - 'CodeCommit'
+  GitRepo:
+    Description: Git repository, such as username/repository for github or demo-repo123 for codecommit.
+    Type: String
+  GitBranch:
+    Type: String
+    Default: main
+  Project:
+    Type: String
+    Default: serverless
+    MinLength: 4
+    MaxLength: 16
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  Email:
+    Description: The email to subscribe to the SNS topic, used for Manual approval before releasing to production. Leave empt if not in use.
+    Type: String
+    Default: ""
+
+Conditions:
+  AddPolicies: !Not [!Equals [!Ref FirstRun, true]]
+  ShouldCreateSubscription: !Not [!Equals [!Ref Email, ""]]
+  IsGitHubRepo:  !Equals [!Ref GitType, "GitHub"]
+  
+Resources:
+  CodeStarConnection:
+    Condition: IsGitHubRepo
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: GitRepositoryConnection
+      ProviderType: !Ref GitType
+  KMSKey:
+    DependsOn: PipeLineRole
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Used by Assumed Roles in Dev/Prod accounts to Encrypt/Decrypt code
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Sub ${Project}-Key
+        Statement:
+          -
+            Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          -
+            Sid: Allow use of the key for CryptoGraphy Lambda
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${ProductionAccount}:root
+                - !Sub arn:aws:iam::${DevAccount}:root
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${Project}-codepipeline-Role
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${Project}-codebuild-Role
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${Project}-key
+      TargetKeyId: !Ref KMSKey
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-${Project}-pipe-artifacts
+      VersioningConfiguration:
+        Status: Enabled
+  S3BucketPolicy:
+    Condition: AddPolicies
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+                - !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-cloudformationdeployer-role
+                - !Sub arn:aws:iam::${DevAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+                - !Sub arn:aws:iam::${DevAccount}:role/${Project}-cloudformationdeployer-role
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${Project}-codepipeline-Role
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${Project}-codebuild-Role
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-codebuild-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+  BuildProjectPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-codebuild-Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+              - !Sub arn:aws:s3:::${ArtifactBucket}
+          -
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: !GetAtt KMSKey.Arn
+          -
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          -
+            Sid: cloudformation
+            Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+            Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:*'
+          -
+            Sid: CodeReport
+            Effect: Allow
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:UpdateReport
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*"
+      Roles:
+        -
+          !Ref BuildProjectRole
+  PipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-codepipeline-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+  PipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${Project}-codepipeline-Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - !If 
+            - IsGitHubRepo
+            - !Ref 'AWS::NoValue'
+            -
+              Sid: codecommit
+              Effect: Allow
+              Action:
+                - codecommit:List*
+                - codecommit:Get*
+                - codecommit:GitPull
+                - codecommit:UploadArchive
+                - codecommit:CancelUploadArchive
+              Resource:
+                - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${GitRepo}
+          -
+            Sid: codebuild
+            Effect: Allow
+            Action:
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+            Resource:
+              - !GetAtt BuildProject.Arn
+          -
+            Sid: kms
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: !GetAtt KMSKey.Arn
+          -
+            Sid: s3
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+              - !Sub arn:aws:s3:::${ArtifactBucket}
+          -
+            Sid: iam
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+              - !Sub arn:aws:iam::${DevAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+          - !If 
+            - ShouldCreateSubscription
+            -
+              Sid: ManualApproval
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref ProjectTopic
+            - !Ref 'AWS::NoValue'
+          - !If 
+            - IsGitHubRepo
+            -
+              Sid: Codestar
+              Effect: Allow
+              Action:
+                - codestar-connections:UseConnection
+              Resource: !Ref CodeStarConnection
+            - !Ref 'AWS::NoValue'
+      Roles:
+        -
+          !Ref PipeLineRole
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Project}-BuildProject
+      Description: !Sub ${Project}-BuildProject
+      EncryptionKey: !GetAtt KMSKey.Arn
+      ServiceRole: !GetAtt BuildProjectRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref ArtifactBucket
+      Source:
+        Type: CODEPIPELINE
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: AddPolicies
+    Properties:
+      ArtifactStore:
+        Location: !Ref ArtifactBucket
+        Type: "S3"
+        EncryptionKey:
+          Id: !Ref KMSKey
+          Type: KMS
+      RoleArn: !GetAtt PipeLineRole.Arn
+      Name: !Sub ${Project}-Pipeline
+      Stages:
+        - Name: Source
+          Actions:
+            - !If
+              - IsGitHubRepo
+              - Name: App
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: '1'
+                  Provider: CodeStarSourceConnection
+                Configuration:
+                  ConnectionArn: !Ref CodeStarConnection
+                  FullRepositoryId: !Ref GitRepo
+                  BranchName: !Ref GitBranch
+                OutputArtifacts:
+                  - Name: ccArtifact
+                RunOrder: 1
+              - Name: App
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: '1'
+                  Provider: CodeCommit
+                Configuration:
+                  RepositoryName: !Ref GitRepo
+                  BranchName: !Ref GitBranch
+                OutputArtifacts:
+                  - Name: ccArtifact
+                RunOrder: 1
+        - Name: "Build_Templates"
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Sub ${Project}-BuildProject
+              InputArtifacts:
+                - Name: ccArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+        - Name: "Deploy_To_Dev"
+          Actions:
+            - Name: CreateChangeSet_Dev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Sub "${Project}-Changeset-Dev"
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${Project}-Dev"
+                Capabilities: CAPABILITY_IAM
+                # ParameterOverrides: |
+                #  {
+                #  "Environment" : "dev"
+                #  }
+                TemplatePath: BuildArtifact::template-export.yml
+                RoleArn: !Sub arn:aws:iam::${DevAccount}:role/${Project}-cloudformationdeployer-role
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+              RoleArn: !Sub arn:aws:iam::${DevAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+            - Name: ExecuteChangeSet_Dev
+              Namespace: "DeployVariables"
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                RoleArn: !Sub arn:aws:iam::${DevAccount}:role/${Project}-cloudformationdeployer-role
+                StackName: !Sub "${Project}-Dev"
+                ChangeSetName: !Sub "${Project}-Changeset-Dev"
+              OutputArtifacts:
+                - Name: !Sub "${Project}-Changeset-Dev"
+              RunOrder: 2
+              RoleArn: !Sub arn:aws:iam::${DevAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+            - !If
+              - ShouldCreateSubscription
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Version: '1'
+                  Provider: Manual
+                Configuration:
+                  NotificationArn: !If [ShouldCreateSubscription, !Ref ProjectTopic, !Ref 'AWS::NoValue']
+                  CustomData: 'Please review and approve this deployment found at: #{DeployVariables.WebEndpoint}' 
+                RunOrder: 3
+              - !Ref 'AWS::NoValue'
+        - Name: "Deploy_To_Prod"
+          Actions:
+            - Name: CreateChangeSet_Prod
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ChangeSetName: !Sub "${Project}-Changeset-Prod"
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${Project}-Prod"
+                Capabilities: CAPABILITY_IAM
+                # ParameterOverrides: |
+                #   {
+                #   "Environment" : "prod"
+                #   }
+                TemplatePath: BuildArtifact::template-export.yml
+                RoleArn: !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-cloudformationdeployer-role
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+              RoleArn: !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+            - Name: ExecuteChangeSet_Prod
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                RoleArn: !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-cloudformationdeployer-role
+                StackName: !Sub "${Project}-Prod"
+                ChangeSetName: !Sub "${Project}-Changeset-Prod"
+              OutputArtifacts:
+                - Name: !Sub "${Project}-Changeset-Prod"
+              RunOrder: 2
+              RoleArn: !Sub arn:aws:iam::${ProductionAccount}:role/${Project}-CentralAcctCodePipelineCFRole
+
+            
+  ProjectTopic:
+    Type: AWS::SNS::Topic
+    Condition: ShouldCreateSubscription
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-approval"
+      TopicName: !Sub "${AWS::StackName}-approval"
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ShouldCreateSubscription
+    Properties:
+      Endpoint: !Ref Email
+      Protocol: email
+      TopicArn: !Ref ProjectTopic
+
+Outputs:
+  ArtifactBucket:
+    Value: !Ref ArtifactBucket
+  CMK:
+    Value: !GetAtt KMSKey.Arn
+  CentralAccount:
+    Value: !Ref AWS::AccountId
+  DevAccount:
+    Value: !Ref DevAccount
+  ProductionAccount:
+    Value: !Ref ProductionAccount
+  Project:
+    Value: !Ref Project
+  GitType:
+    Value: !Ref GitType
+  GitRepo:
+    Value: !Ref GitRepo
+  GitBranch:
+    Value: !Ref GitBranch
+  FirstRun:
+    Value: False
+  Email:
+    Value: !Ref Email
+
